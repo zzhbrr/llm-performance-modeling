@@ -2,6 +2,8 @@ result = {"prefill":{}, "decode":{}}
 
 Operations = ["Q", "K", "V", "qk_matmul", "softmax", "sv_matmul", "O", "FFN_up", "FFN_gate", "FFN_down"]
 
+weight_size = {}
+
 # Hardware Spec
 hardware = { # H100
     "bandwidth": 3072e9, # bytes/s 
@@ -20,23 +22,24 @@ def record(stage, operation, OPs, load_weight, load_act, store_act, load_kv_cach
         "load_kv_cache": load_kv_cache,
         "store_kv_cache": store_kv_cache
     }
+    weight_size[operation] = load_weight
     
 # Workload Spec
-batchsize = 1 # bachsize
+batchsize = 10 # bachsize
 seql = 1024 # sequence length
 
+# Model Spec
+d = 8192 # hidden dimension
+d_ffn = 28672 # feedforward dimension
+h = 64 # number of attention heads
+h_kv = 8 # number of key-value heads
+a_byte = 2
+w_byte = 2
+kv_byte = 2
+headsize = d // h
+
+
 def analyze():
-    # Model Spec
-    d = 8192 # hidden dimension
-    d_ffn = 28672 # feedforward dimension
-    h = 64 # number of attention heads
-    h_kv = 8 # number of key-value heads
-    a_byte = 2
-    w_byte = 2
-    kv_byte = 2
-
-    headsize = d // h
-
 
     for op in Operations:
         if op == "Q":
@@ -176,16 +179,18 @@ def analyze():
                    load_kv_cache=0, 
                    store_kv_cache=0)
 
+def GetKVCacheSize(): # bytes
+    return 2 * seql * batchsize * h_kv * headsize * kv_byte
         
-        
-    
     
 if __name__ == "__main__":
     analyze()
+    # VERBOSE = True
     VERBOSE = False
+    t = {"prefill":{}, "decode":{}}
     for stage in ['prefill', 'decode']:
-        print("Stage: ", stage)
-        t = 0
+        print("Stage:", stage)
+        t[stage] = 0
         for op in Operations:
             if VERBOSE:
                 print('{')
@@ -198,9 +203,12 @@ if __name__ == "__main__":
                 print("load_kv_cache: ", result[stage][op]["load_kv_cache"])
                 print("store_kv_cache: ", result[stage][op]["store_kv_cache"])
                 print('}')
-            t += result[stage][op]["time"]
-        print("Total time: ", t, "us")
+            t[stage] += result[stage][op]["time"]
+        print("Total time: ", t[stage], "us")
     
-    
-    
+    kvsize = GetKVCacheSize()
+    print("KV Cache Size: ", kvsize / 1024 / 1024 / 1024, "GB")
+
+    MemoryBW = 200*1024*1024*1024 # 200GB/s
+    print("can prefetch ", t["decode"] * MemoryBW * 1e-6 / 1024 / 1024 / 1024, "GB")
     
