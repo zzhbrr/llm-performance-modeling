@@ -222,14 +222,14 @@ def analyze():
 
 def GetKVCacheSizePerLayer(): # bytes
     return 2 * seql * batchsize * h_kv * headsize * kv_byte
-        
+
     
 if __name__ == "__main__":
     model_name = "OPT-30B"
     ModelSpec(model_name)
     analyze()
-    VERBOSE = True
-    # VERBOSE = False
+    # VERBOSE = True
+    VERBOSE = False
     PrintConfig()
     t = {"prefill":{}, "decode":{}}
     for stage in ['prefill', 'decode']:
@@ -240,18 +240,27 @@ if __name__ == "__main__":
                 print('{')
                 print("    operation: ", result[stage][op]["name"])
                 print("    time: ", result[stage][op]["time"])
-                # print("    OPs: ", result[stage][op]["OPs"])
-                # print("    load_weight: ", result[stage][op]["load_weight"])
-                # print("    load_act: ", result[stage][op]["load_act"])
-                # print("    store_act: ", result[stage][op]["store_act"])
-                # print("    load_kv_cache: ", result[stage][op]["load_kv_cache"])
-                # print("    store_kv_cache: ", result[stage][op]["store_kv_cache"])
+                print("    OPs: ", result[stage][op]["OPs"])
+                print("    load_weight: ", result[stage][op]["load_weight"])
+                print("    load_act: ", result[stage][op]["load_act"])
+                print("    store_act: ", result[stage][op]["store_act"])
+                print("    load_kv_cache: ", result[stage][op]["load_kv_cache"])
+                print("    store_kv_cache: ", result[stage][op]["store_kv_cache"])
                 print('}')
             t[stage] += result[stage][op]["time"]
-        print("Total time: ", t[stage], "us")
+        # 保留两位小数
+        print("Total time: ", round(t[stage], 2), "us")
+    print("")
     
     kvsize = GetKVCacheSizePerLayer()
-    print("KV Cache Size: ", kvsize / 1024 / 1024 / 1024, "GB")
+    print("KV Cache Size: ", round(kvsize / 1024 / 1024 / 1024, 3), "GB")
 
-    MemoryBW = 400*1024*1024*1024 # 400GB/s
-    print("can prefetch", t["decode"] * MemoryBW * 1e-6 / 1024 / 1024 / 1024, "GB every layer")
+    print("activation size: ", round(batchsize * seql * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
+
+    for op in Operations:
+        if op not in ['qk_matmul', 'softmax', 'sv_matmul']:
+            print(op, "weight size: ", round(weight_size[op] / 1024 / 1024 / 1024, 3), "GB")
+    
+    print("")
+    MemoryBW = 400 # 400GB/s
+    print("can prefetch", round(t["decode"] * MemoryBW * 1e-6, 3), "GB every layer if network bandwidth is", MemoryBW, "GB/s")
