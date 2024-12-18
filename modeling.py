@@ -6,8 +6,8 @@ weight_size = {}
 
 # Hardware Spec
 hardware = { # H100, 3TB/s，989 TFLOPS
-    "bandwidth": 3072e9, # bytes/s 
-    "FP16": 1979e12 / 2 # OPs/s
+    "bandwidth": 3072e9 , # bytes/s 
+    "FP16": 1979e12 / 2  # OPs/s
 }
 
 def record(stage, operation, OPs, load_weight, load_act, store_act, load_kv_cache, store_kv_cache):
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     model_name = "OPT-30B"
     ModelSpec(model_name)
     analyze()
-    # VERBOSE = True
+    
     VERBOSE = False
     PrintConfig()
     t = {"prefill":{}, "decode":{}}
@@ -248,19 +248,22 @@ if __name__ == "__main__":
                 print("    store_kv_cache: ", result[stage][op]["store_kv_cache"])
                 print('}')
             t[stage] += result[stage][op]["time"]
-        # 保留两位小数
         print("Total time: ", round(t[stage], 2), "us")
     print("")
     
     kvsize = GetKVCacheSizePerLayer()
     print("KV Cache Size: ", round(kvsize / 1024 / 1024 / 1024, 3), "GB")
 
-    print("activation size: ", round(batchsize * seql * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
+    print("activation size in decode stage: ", round(batchsize * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
+    print("activation size in prefill stage: ", round(batchsize * seql * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
+    print("QK intermediate size in decode stage: ", round(batchsize * seql * h * headsize * a_byte / 1024 / 1024 / 1024, 3), "GB")
+    print("QK intermediate size in prefill stage: ", round(batchsize * seql * seql * h * headsize * a_byte / 1024 / 1024 / 1024, 3), "GB")
+    print("")
 
     for op in Operations:
         if op not in ['qk_matmul', 'softmax', 'sv_matmul']:
             print(op, "weight size: ", round(weight_size[op] / 1024 / 1024 / 1024, 3), "GB")
     
     print("")
-    MemoryBW = 400 # 400GB/s
+    MemoryBW = 50 
     print("can prefetch", round(t["decode"] * MemoryBW * 1e-6, 3), "GB every layer if network bandwidth is", MemoryBW, "GB/s")
