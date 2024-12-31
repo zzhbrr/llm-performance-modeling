@@ -6,8 +6,8 @@ weight_size = {}
 
 # Hardware Spec
 hardware = { # H100, 3TB/s，989 TFLOPS
-    "bandwidth": 3072e9 , # bytes/s 
-    "FP16": 1979e12 / 2  # OPs/s
+    "bandwidth": 3072e9/5 , # bytes/s 
+    "FP16": 1979e12 / 2/5  # OPs/s
 }
 
 def record(stage, operation, OPs, load_weight, load_act, store_act, load_kv_cache, store_kv_cache):
@@ -25,8 +25,8 @@ def record(stage, operation, OPs, load_weight, load_act, store_act, load_kv_cach
     weight_size[operation] = load_weight
     
 # Workload Spec
-batchsize = 100 # bachsize
-seql = 102 # sequence length
+batchsize = 1 # bachsize
+seql = 1024 # sequence length
 
 # Model Spec
 model_name = "Llama2-70B" 
@@ -55,6 +55,15 @@ def ModelSpec(model_name):
         d_ffn = 28672
         h = 56
         h_kv = 56
+        a_byte = 2
+        w_byte = 2
+        kv_byte = 2
+    elif model_name == "7B":
+        L = 32
+        d = 4096
+        d_ffn = 11008
+        h = 32
+        h_kv = 32
         a_byte = 2
         w_byte = 2
         kv_byte = 2
@@ -225,7 +234,8 @@ def GetKVCacheSizePerLayer(): # bytes
 
     
 if __name__ == "__main__":
-    model_name = "OPT-30B"
+    # model_name = "OPT-30B"
+    model_name = "7B"
     ModelSpec(model_name)
     analyze()
     
