@@ -233,7 +233,7 @@ def analyze():
                    OPs = 2 * batchsize * seql * d_ffn * d / tp_size, 
                    load_weight=d_ffn * d * w_byte / tp_size, 
                    load_act=batchsize * seql * d_ffn * a_byte / tp_size, 
-                   store_act=batchsize * seql * d * a_byte / tp_size, 
+                   store_act=batchsize * seql * d * a_byte, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
             record("decode", 
@@ -241,7 +241,7 @@ def analyze():
                    OPs = 2 * batchsize * d_ffn * d / tp_size, 
                    load_weight=d_ffn * d * w_byte / tp_size, 
                    load_act=batchsize * d_ffn * a_byte / tp_size, 
-                   store_act=batchsize * d * a_byte / tp_size, 
+                   store_act=batchsize * d * a_byte, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
 
@@ -250,8 +250,8 @@ def GetKVCacheSizePerLayer(): # bytes
 
     
 if __name__ == "__main__":
-    # model_name = "OPT-30B"
-    model_name = "7B"
+    model_name = "OPT-30B"
+    # model_name = "7B"
     ModelSpec(model_name)
     analyze()
     
