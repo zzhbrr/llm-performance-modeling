@@ -1,6 +1,7 @@
 result = {"prefill":{}, "decode":{}}
+communication_result = {"prefill":0, "decode":0}
 
-Operations = ["Q", "K", "V", "qk_matmul", "softmax", "sv_matmul", "O", "FFN_up", "FFN_gate", "FFN_down"]
+Operations = ["Q", "K", "V", "qk_matmul", "softmax", "sv_matmul", "O", "gate", "FFN_up", "FFN_gate", "FFN_down"]
 
 weight_size = {}
 
@@ -25,65 +26,82 @@ def record(stage, operation, OPs, load_weight, load_act, store_act, load_kv_cach
     weight_size[operation] = load_weight
     
 # Model Spec
-model_name = "Llama2-70B" 
-L = 80 # number of layers
-d = 8192 # hidden dimension
-d_ffn = 28672 # feedforward dimension
-h = 64 # number of attention heads
+model_name = "Hunyuan-Large"
+L = 64 # number of layers
+d = 6400 # hidden dimension
+d_ffn = 18304 # feedforward dimension
+h = 80 # number of attention heads
 h_kv = 8 # number of key-value heads
+expert_num = 16 # number of experts
+topk = 1 # top-k experts to route
+shared_expert_num = 1 # number of shared experts
+cla = 2 # cla share factor
 a_byte = 2
 w_byte = 2
 kv_byte = 2
 headsize = d // h
+kv_lora_rank = 0
+q_lora_rank = 0
 
 # Workload Spec
 batchsize = 1
-seql = 5502 # sequence length
+seql = 512 # sequence length
+global_bachsize = batchsize
 
 # Parallelization Spec
-tp_size = 8
 pp_size = 1
-# intra_bw = 50 # GB/s
+nonmoe_dp_size = 8
+nonmoe_tp_size = 1
+moe_dp_size = 1
+moe_tp_size = 1
+moe_ep_size = 8
+
 intra_bw = 400 # GB/s
 intra_lat = 1.5 # us
-# inter_bw = 50 # GB/s
-# inter_lat = 2 # us
+inter_bw = 50 # GB/s
+inter_lat = 2 # us
 
 
 def ModelSpec(model_name):
-    global d, d_ffn, h, h_kv, a_byte, w_byte, kv_byte, headsize, L
-    if model_name == "Llama2-70B":
-        L = 80
-        d = 8192 
-        d_ffn = 28672 
-        h = 64 
-        h_kv = 8 
-        a_byte = 2 
+    global d, d_ffn, h, h_kv, a_byte, w_byte, kv_byte, headsize, L, expert_num, topk, shared_expert_num, cla, kv_lora_rank, q_lora_rank
+    if model_name == "Hunyuan-Large":
+        L = 64
+        d = 6400
+        d_ffn = 18304
+        h = 80
+        h_kv = 8
+        expert_num = 16
+        topk = 1
+        shared_expert_num = 1
+        cla = 2
+        a_byte = 2
         w_byte = 2
         kv_byte = 2
         headsize = d // h
-    elif model_name == "OPT-30B":
-        L = 48
+        kv_lora_rank = 0
+        q_lora_rank = 0
+    elif model_name == "DeepSeek-V3":
+        L = 61
         d = 7168
-        d_ffn = 28672
-        h = 56
-        h_kv = 56
+        d_ffn = 18432
+        h = 128
+        h_kv = 128
+        expert_num = 256
+        topk = 8
+        shared_expert_num = 1
+        cla = 0
         a_byte = 2
         w_byte = 2
         kv_byte = 2
-    elif model_name == "7B":
-        L = 32
-        d = 4096
-        d_ffn = 11008
-        h = 32
-        h_kv = 32
-        a_byte = 2
-        w_byte = 2
-        kv_byte = 2
+        headsize = d // h
+        kv_lora_rank = 512
+        q_lora_rank = 1536
     else:
         raise ValueError("Invalid model name")
 
 def PrintConfig():
+    assert nonmoe_dp_size * nonmoe_tp_size == moe_dp_size * moe_tp_size * moe_ep_size 
+    assert moe_ep_size <= expert_num
     print("Configuration: {")
     print("Hardware: ")
     print("    bandwidth: ", hardware["bandwidth"])
@@ -101,158 +119,226 @@ def PrintConfig():
     print("    w_byte: ", w_byte)
     print("    kv_byte: ", kv_byte)
     print("    headsize: ", headsize)
+    print("    Expert_num: ", expert_num)
+    print("    topk: ", topk)
+    print("    shared_expert_num: ", shared_expert_num)
+    if cla != 0:
+        print("    cla: ", cla)
+    if kv_lora_rank != 0:   
+        print("    kv_lora_rank: ", kv_lora_rank)
+    if q_lora_rank != 0:
+        print("    q_lora_rank: ", q_lora_rank)
     print("Parallelization: ")
-    print("    tp_size: ", tp_size)
+    print("    nonmoe_dp_size: ", nonmoe_dp_size)
+    print("    nonmoe_tp_size: ", nonmoe_tp_size)
+    print("    moe_dp_size: ", moe_dp_size)
+    print("    moe_tp_size: ", moe_tp_size)
+    print("    moe_ep_size: ", moe_ep_size)
     print("    pp_size: ", pp_size)
     print("}")  
 
 def analyze():
+    global global_bachsize
+    global_bachsize = batchsize
+    
     for op in Operations:
+        # Non MoE part
+        batchsize = global_bachsize // nonmoe_dp_size
+        if nonmoe_tp_size != 0:
+            # One AllReduce in Attention Calculation
+            communication_result["prefill"] = 2 * batchsize * seql * d * a_byte * (nonmoe_tp_size - 1) / nonmoe_tp_size
+            communication_result["decode"] = 2 * batchsize * d * a_byte * (nonmoe_tp_size - 1) / nonmoe_tp_size
         if op == "Q":
             record("prefill", 
                    op, 
-                   OPs = 2 * seql * batchsize * d * d / tp_size, 
-                   load_weight = d * d * w_byte / tp_size, 
+                   OPs = 2 * seql * batchsize * d * d / nonmoe_tp_size, 
+                   load_weight = d * d * w_byte / nonmoe_tp_size, 
                    load_act = seql * batchsize * d * a_byte, 
-                   store_act = seql * batchsize * d * a_byte / tp_size, 
+                   store_act = seql * batchsize * d * a_byte / nonmoe_tp_size, 
                    load_kv_cache = 0, 
                    store_kv_cache = 0)
             record("decode", 
                    op, 
-                   OPs = 2 * batchsize * d * d / tp_size, 
-                   load_weight = d * d * w_byte / tp_size, 
+                   OPs = 2 * batchsize * d * d / nonmoe_tp_size, 
+                   load_weight = d * d * w_byte / nonmoe_tp_size, 
                    load_act = batchsize * d * a_byte, 
-                   store_act = batchsize * d * a_byte / tp_size, 
+                   store_act = batchsize * d * a_byte / nonmoe_tp_size, 
                    load_kv_cache = 0, 
                    store_kv_cache = 0)
         elif op == "K" or op == "V":
             record("prefill", 
                    op, 
-                   OPs = 2 * seql * batchsize * d * h_kv * headsize / tp_size, 
-                   load_weight = d * h_kv * headsize * w_byte / tp_size, 
+                   OPs = 2 * seql * batchsize * d * h_kv * headsize / nonmoe_tp_size, 
+                   load_weight = d * h_kv * headsize * w_byte / nonmoe_tp_size, 
                    load_act = seql * batchsize * d * a_byte, 
                    store_act = 0, 
                    load_kv_cache = 0, 
-                   store_kv_cache = seql * batchsize * h_kv * headsize * kv_byte / tp_size)
+                   store_kv_cache = seql * batchsize * h_kv * headsize * kv_byte / nonmoe_tp_size)
             record("decode", 
                    op, 
-                   OPs = 2 * batchsize * d * h_kv * headsize / tp_size, 
-                   load_weight = d * h_kv * headsize * w_byte / tp_size, 
+                   OPs = 2 * batchsize * d * h_kv * headsize / nonmoe_tp_size, 
+                   load_weight = d * h_kv * headsize * w_byte / nonmoe_tp_size, 
                    load_act = batchsize * d * a_byte, 
                    store_act = 0, 
                    load_kv_cache = 0, 
-                   store_kv_cache = batchsize * h_kv * headsize * kv_byte / tp_size)
+                   store_kv_cache = batchsize * h_kv * headsize * kv_byte / nonmoe_tp_size)
         elif op == "qk_matmul":
             record("prefill", 
                    op, 
-                   OPs = 2 * batchsize * seql * seql * h * headsize / tp_size, 
+                   OPs = 2 * batchsize * seql * seql * h * headsize / nonmoe_tp_size, 
                    load_weight = 0, 
-                   load_act = seql * batchsize * h * headsize * a_byte / tp_size, 
-                   store_act = batchsize * seql * seql * h * a_byte / tp_size, 
-                   load_kv_cache = seql * headsize * batchsize * h_kv * kv_byte / tp_size, 
+                   load_act = seql * batchsize * h * headsize * a_byte / nonmoe_tp_size, 
+                   store_act = batchsize * seql * seql * h * a_byte / nonmoe_tp_size, 
+                   load_kv_cache = seql * headsize * batchsize * h_kv * kv_byte / nonmoe_tp_size, 
                    store_kv_cache=0)
             record("decode", 
                    op, 
-                   OPs = 2 * batchsize * seql * h * headsize / tp_size, 
+                   OPs = 2 * batchsize * seql * h * headsize / nonmoe_tp_size, 
                    load_weight=0, 
-                   load_act = batchsize * h * headsize * a_byte / tp_size, 
-                   store_act = batchsize * seql * h * a_byte / tp_size, 
-                   load_kv_cache = seql * headsize * batchsize * h_kv * kv_byte / tp_size, 
+                   load_act = batchsize * h * headsize * a_byte / nonmoe_tp_size, 
+                   store_act = batchsize * seql * h * a_byte / nonmoe_tp_size, 
+                   load_kv_cache = seql * headsize * batchsize * h_kv * kv_byte / nonmoe_tp_size, 
                    store_kv_cache=0)
         elif op == "softmax":
             record("prefill", 
                    op, 
-                   OPs = 5 * batchsize * seql * seql * h / tp_size, 
+                   OPs = 5 * batchsize * seql * seql * h / nonmoe_tp_size, 
                    load_weight=0,
-                   load_act=batchsize * seql * seql * h * a_byte / tp_size, 
-                   store_act=batchsize * seql * seql * h * a_byte / tp_size, 
+                   load_act=batchsize * seql * seql * h * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * seql * seql * h * a_byte / nonmoe_tp_size, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
             record("decode", 
                    op, 
-                   OPs = 5 * batchsize * seql * h / tp_size, 
+                   OPs = 5 * batchsize * seql * h / nonmoe_tp_size, 
                    load_weight=0, 
-                   load_act=batchsize * seql * h * a_byte / tp_size, 
-                   store_act=batchsize * seql * h * a_byte / tp_size, 
+                   load_act=batchsize * seql * h * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * seql * h * a_byte / nonmoe_tp_size, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
         elif op == "sv_matmul":
             record("prefill", 
                    op, 
-                   OPs = 2 * batchsize * seql * seql * headsize * h / tp_size,
+                   OPs = 2 * batchsize * seql * seql * headsize * h / nonmoe_tp_size,
                    load_weight=0, 
-                   load_act=batchsize * seql * seql * h * a_byte / tp_size, 
-                   store_act=batchsize * seql * h * headsize * a_byte / tp_size, 
-                   load_kv_cache=batchsize * seql * headsize * h_kv * kv_byte / tp_size, 
+                   load_act=batchsize * seql * seql * h * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * seql * h * headsize * a_byte / nonmoe_tp_size, 
+                   load_kv_cache=batchsize * seql * headsize * h_kv * kv_byte / nonmoe_tp_size, 
                    store_kv_cache=0)
             record("decode", 
                    op, 
-                   OPs = 2 * batchsize * seql * headsize * h / tp_size, 
+                   OPs = 2 * batchsize * seql * headsize * h / nonmoe_tp_size, 
                    load_weight=0, 
-                   load_act=batchsize * seql * h * a_byte / tp_size, 
-                   store_act=batchsize * h * headsize * a_byte / tp_size, 
-                   load_kv_cache=batchsize * seql * headsize * h_kv * kv_byte / tp_size, 
+                   load_act=batchsize * seql * h * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * h * headsize * a_byte / nonmoe_tp_size, 
+                   load_kv_cache=batchsize * seql * headsize * h_kv * kv_byte / nonmoe_tp_size, 
                    store_kv_cache=0)
         elif op == "O":
             record("prefill", 
                    op, 
-                   OPs = 2 * batchsize * seql * d * d / tp_size, 
-                   load_weight=d * d * w_byte / tp_size, 
-                   load_act=batchsize * seql * d * a_byte / tp_size, 
-                   store_act=batchsize * seql * d * a_byte / tp_size, 
+                   OPs = 2 * batchsize * seql * d * d / nonmoe_tp_size, 
+                   load_weight=d * d * w_byte / nonmoe_tp_size, 
+                   load_act=batchsize * seql * d * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * seql * d * a_byte / nonmoe_tp_size, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
             record("decode", 
                    op, 
-                   OPs = 2 * batchsize * d * d / tp_size, 
-                   load_weight=d * d * w_byte / tp_size, 
-                   load_act=batchsize * d * a_byte / tp_size, 
-                   store_act=batchsize * d * a_byte / tp_size, 
+                   OPs = 2 * batchsize * d * d / nonmoe_tp_size, 
+                   load_weight=d * d * w_byte / nonmoe_tp_size, 
+                   load_act=batchsize * d * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * d * a_byte / nonmoe_tp_size, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
-        elif op == "FFN_up" or op == "FFN_gate":
+        elif op == "gate":
             record("prefill", 
                    op, 
-                   OPs = 2 * batchsize * seql * d * d_ffn / tp_size, 
-                   load_weight=d * d_ffn * w_byte / tp_size, 
-                   load_act=batchsize * seql * d * a_byte, 
-                   store_act=batchsize * seql * d_ffn * a_byte / tp_size, 
+                   OPs = 2 * batchsize * seql * d * expert_num / nonmoe_tp_size, 
+                   load_weight=d * expert_num * w_byte / nonmoe_tp_size, 
+                   load_act=batchsize * seql * d * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * seql * expert_num * a_byte / nonmoe_tp_size, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
             record("decode", 
                    op, 
-                   OPs = 2 * batchsize * d * d_ffn / tp_size, 
-                   load_weight= d * d_ffn * w_byte / tp_size, 
-                   load_act= batchsize * d * a_byte, 
-                   store_act= batchsize * d_ffn * a_byte / tp_size, 
+                   OPs = 2 * batchsize * d * expert_num / nonmoe_tp_size, 
+                   load_weight=d * expert_num * w_byte / nonmoe_tp_size, 
+                   load_act=batchsize * d * a_byte / nonmoe_tp_size, 
+                   store_act=batchsize * expert_num * a_byte / nonmoe_tp_size, 
+                   load_kv_cache=0, 
+                   store_kv_cache=0)
+    else: 
+        # MoE part
+        batchsize = global_bachsize
+        prefill_average_activated_expertnum = min(batchsize * seql * topk, expert_num) + shared_expert_num
+        decode_average_activated_expertnum = min(batchsize * topk, expert_num) + shared_expert_num
+
+        if op == "FFN_up" or op == "FFN_gate":
+            record("prefill", 
+                   op, 
+                   OPs = 2 * batchsize * seql * d * d_ffn / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                   load_weight=d * d_ffn * w_byte / moe_tp_size / moe_ep_size * prefill_average_activated_expertnum, 
+                   load_act=batchsize * seql * d * a_byte / moe_ep_size * (topk + shared_expert_num),
+                   store_act=batchsize * seql * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                   load_kv_cache=0, 
+                   store_kv_cache=0)
+            record("decode", 
+                   op, 
+                   OPs = 2 * batchsize * d * d_ffn / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                   load_weight= d * d_ffn * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
+                   load_act= batchsize * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
+                   store_act= batchsize * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
                    load_kv_cache=0, 
                    store_kv_cache=0)
         elif op == "FFN_down":
             record("prefill", 
                    op, 
-                   OPs = 2 * batchsize * seql * d_ffn * d / tp_size, 
-                   load_weight=d_ffn * d * w_byte / tp_size, 
-                   load_act=batchsize * seql * d_ffn * a_byte / tp_size, 
-                   store_act=batchsize * seql * d * a_byte, 
+                   OPs = 2 * batchsize * seql * d_ffn * d / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                   load_weight=d_ffn * d * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
+                   load_act=batchsize * seql * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                   store_act=batchsize * seql * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
                    load_kv_cache=0, 
                    store_kv_cache=0)
             record("decode", 
                    op, 
-                   OPs = 2 * batchsize * d_ffn * d / tp_size, 
-                   load_weight=d_ffn * d * w_byte / tp_size, 
-                   load_act=batchsize * d_ffn * a_byte / tp_size, 
-                   store_act=batchsize * d * a_byte, 
+                   OPs = 2 * batchsize * d_ffn * d / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                   load_weight=d_ffn * d * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
+                   load_act=batchsize * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                   store_act=batchsize * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
                    load_kv_cache=0, 
                    store_kv_cache=0)
+        # communication calculation
+        bs1 = global_bachsize // nonmoe_dp_size
+        bs2 = global_bachsize // moe_dp_size
+        # if moe_dp_size >= nonmoe_dp_size, no all2all, one allreduce
+        if moe_dp_size >= nonmoe_dp_size:
+            communication_result["prefill"] += bs1 * 2 * seql * d * (nonmoe_tp_size - 1) / nonmoe_tp_size * a_byte
+            communication_result["decode"] += bs1 * 2 * d * (nonmoe_tp_size - 1) / nonmoe_tp_size * a_byte
+        else: # if moe_dp_size < nonmoe_dp_size, two all2all required, and if moe_tp_size > 0, one allreduce
+            # alltoall 1
+            communication_result["prefill"] += bs1 * seql * topk * d * (moe_ep_size - 1) / moe_ep_size * moe_tp_size / nonmoe_tp_size  * a_byte
+            communication_result["decode"] += bs1 * topk * d * (moe_ep_size - 1) / moe_ep_size * moe_tp_size / nonmoe_tp_size  * a_byte
+            # allreduce
+            communication_result["prefill"] += 2 * bs2 * seql * d * (moe_tp_size - 1) / moe_tp_size * a_byte
+            communication_result["decode"] += 2 * bs2 * d * (moe_tp_size - 1) / moe_tp_size * a_byte
+            # alltoall 2
+            dp_ = nonmoe_dp_size // moe_dp_size
+            communication_result["prefill"] += bs2 * seql * topk * d * (dp_ - 1) / moe_ep_size * nonmoe_tp_size / moe_tp_size * a_byte
+            communication_result["prefill"] += bs2 * topk * d * (dp_ - 1) / moe_ep_size * nonmoe_tp_size / moe_tp_size * a_byte
+            
 
 def GetKVCacheSizePerLayer(): # bytes
-    return 2 * seql * batchsize * h_kv * headsize * kv_byte
+    if kv_lora_rank == 0:
+        pass
+    res = 2 * seql * batchsize * h_kv * headsize * kv_byte
+    if cla:
+        res /= cla
+    return res
 
     
 if __name__ == "__main__":
-    model_name = "Llama2-70B"
-    # model_name = "OPT-30B"
-    # model_name = "7B"
+    model_name = "Hunyuan-Large"
+    # model_name = "DeepSeek-V3"
     ModelSpec(model_name)
     analyze()
     
@@ -262,14 +348,14 @@ if __name__ == "__main__":
     for stage in ['prefill', 'decode']:
         print("Stage:", stage)
         t[stage] = 0
-        if tp_size != 1:
+        if nonmoe_tp_size != 1:
             if stage == 'prefill':
                 volume = 2 * seql * batchsize * d * a_byte # 一次allreduce的bytes
                 # MLP 和 attention 分别有一次 allreduce
-                networktime = 2 * (tp_size - 1) * (intra_lat + volume / tp_size / 1024 / 1024 / 1024 / intra_bw * 1e6)
+                networktime = 2 * (nonmoe_tp_size - 1) * (intra_lat + volume / nonmoe_tp_size / 1024 / 1024 / 1024 / intra_bw * 1e6)
             elif stage == 'decode':
                 volume = 2 * batchsize * d * a_byte 
-                networktime = 2 * (tp_size - 1) * (intra_lat + volume / tp_size / 1024 / 1024 / 1024 / intra_bw * 1e6)
+                networktime = 2 * (nonmoe_tp_size - 1) * (intra_lat + volume / nonmoe_tp_size / 1024 / 1024 / 1024 / intra_bw * 1e6)
             t[stage] += networktime
             print("TP communication overhead in", stage, "stage: ", round(networktime, 3), "us")
         for op in Operations:
@@ -315,10 +401,10 @@ if __name__ == "__main__":
     for op in Operations:
         if op not in ['qk_matmul', 'softmax', 'sv_matmul']:
             mem_consum += weight_size[op] / 1024 / 1024 / 1024
-    mem_consum += GetKVCacheSizePerLayer() / 1024 / 1024 / 1024 / tp_size
+    mem_consum += GetKVCacheSizePerLayer() / 1024 / 1024 / 1024 / nonmoe_tp_size
     mem_consum *= L / pp_size
-    print("Prefill stage: ", round(mem_consum + seql*batchsize*max(2*d_ffn/tp_size, d)*a_byte/1024/1024/1024, 3), "GB")
-    print("Decode stage: ", round(mem_consum + batchsize*max(2*d_ffn/tp_size, d)*a_byte/1024/1024/1024, 3), "GB")
+    print("Prefill stage: ", round(mem_consum + seql*batchsize*max(2*d_ffn/nonmoe_tp_size, d)*a_byte/1024/1024/1024, 3), "GB")
+    print("Decode stage: ", round(mem_consum + batchsize*max(2*d_ffn/nonmoe_tp_size, d)*a_byte/1024/1024/1024, 3), "GB")
     print("")
 
 
