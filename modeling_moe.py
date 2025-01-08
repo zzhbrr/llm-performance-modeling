@@ -1,5 +1,5 @@
 result = {"prefill":{}, "decode":{}}
-communication_result = {"prefill":0, "decode":0}
+communication_result = {"prefill":{}, "decode":{}}
 
 Operations = ["Q", "K", "V", "qk_matmul", "softmax", "sv_matmul", "O", "gate", "FFN_up", "FFN_gate", "FFN_down"]
 
@@ -7,8 +7,8 @@ weight_size = {}
 
 # Hardware Spec
 hardware = { # H100, 3TB/s，989 TFLOPS
-    "bandwidth": 3072e9 / 5, # bytes/s 
-    "FP16": 1979e12 / 2 / 5 # OPs/s
+    "bandwidth": 3072e9, # bytes/s 
+    "FP16": 1979e12 / 2 # OPs/s
 }
 
 def record(stage, operation, OPs, load_weight, load_act, store_act, load_kv_cache, store_kv_cache):
@@ -24,7 +24,7 @@ def record(stage, operation, OPs, load_weight, load_act, store_act, load_kv_cach
         "store_kv_cache": store_kv_cache
     }
     weight_size[operation] = load_weight
-    
+
 # Model Spec
 model_name = "Hunyuan-Large"
 L = 64 # number of layers
@@ -44,22 +44,22 @@ kv_lora_rank = 0
 q_lora_rank = 0
 
 # Workload Spec
-batchsize = 1
-seql = 512 # sequence length
+batchsize = 256 * 10
+seql = 1024 # sequence length
 global_bachsize = batchsize
 
 # Parallelization Spec
 pp_size = 1
-nonmoe_dp_size = 8
-nonmoe_tp_size = 1
+nonmoe_dp_size = 2
+nonmoe_tp_size = 4
 moe_dp_size = 1
 moe_tp_size = 1
 moe_ep_size = 8
 
 intra_bw = 400 # GB/s
-intra_lat = 1.5 # us
-inter_bw = 50 # GB/s
-inter_lat = 2 # us
+# intra_lat = 1.5 # us
+# inter_bw = 50 # GB/s
+# inter_lat = 2 # us
 
 
 def ModelSpec(model_name):
@@ -102,6 +102,7 @@ def ModelSpec(model_name):
 def PrintConfig():
     assert nonmoe_dp_size * nonmoe_tp_size == moe_dp_size * moe_tp_size * moe_ep_size 
     assert moe_ep_size <= expert_num
+    assert moe_dp_size == 1
     print("Configuration: {")
     print("Hardware: ")
     print("    bandwidth: ", hardware["bandwidth"])
@@ -138,16 +139,15 @@ def PrintConfig():
     print("}")  
 
 def analyze():
-    global global_bachsize
+    global global_bachsize, batchsize
     global_bachsize = batchsize
     
     for op in Operations:
         # Non MoE part
         batchsize = global_bachsize // nonmoe_dp_size
-        if nonmoe_tp_size != 0:
-            # One AllReduce in Attention Calculation
-            communication_result["prefill"] = 2 * batchsize * seql * d * a_byte * (nonmoe_tp_size - 1) / nonmoe_tp_size
-            communication_result["decode"] = 2 * batchsize * d * a_byte * (nonmoe_tp_size - 1) / nonmoe_tp_size
+        # One AllReduce in Attention Calculation if TP used
+        communication_result["prefill"]["Attention_AllReduce"] = 2 * batchsize * seql * d * a_byte * (nonmoe_tp_size - 1) / nonmoe_tp_size
+        communication_result["decode"]["Attention_AllReduce"] = 2 * batchsize * d * a_byte * (nonmoe_tp_size - 1) / nonmoe_tp_size
         if op == "Q":
             record("prefill", 
                    op, 
@@ -267,66 +267,58 @@ def analyze():
                    store_act=batchsize * expert_num * a_byte / nonmoe_tp_size, 
                    load_kv_cache=0, 
                    store_kv_cache=0)
-    else: 
-        # MoE part
-        batchsize = global_bachsize
-        prefill_average_activated_expertnum = min(batchsize * seql * topk, expert_num) + shared_expert_num
-        decode_average_activated_expertnum = min(batchsize * topk, expert_num) + shared_expert_num
+        else: 
+            # MoE part
+            batchsize = global_bachsize
+            prefill_average_activated_expertnum = min(batchsize * seql * topk, expert_num) + shared_expert_num
+            decode_average_activated_expertnum = min(batchsize * topk, expert_num) + shared_expert_num
 
-        if op == "FFN_up" or op == "FFN_gate":
-            record("prefill", 
-                   op, 
-                   OPs = 2 * batchsize * seql * d * d_ffn / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   load_weight=d * d_ffn * w_byte / moe_tp_size / moe_ep_size * prefill_average_activated_expertnum, 
-                   load_act=batchsize * seql * d * a_byte / moe_ep_size * (topk + shared_expert_num),
-                   store_act=batchsize * seql * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   load_kv_cache=0, 
-                   store_kv_cache=0)
-            record("decode", 
-                   op, 
-                   OPs = 2 * batchsize * d * d_ffn / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   load_weight= d * d_ffn * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
-                   load_act= batchsize * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
-                   store_act= batchsize * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   load_kv_cache=0, 
-                   store_kv_cache=0)
-        elif op == "FFN_down":
-            record("prefill", 
-                   op, 
-                   OPs = 2 * batchsize * seql * d_ffn * d / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   load_weight=d_ffn * d * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
-                   load_act=batchsize * seql * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   store_act=batchsize * seql * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
-                   load_kv_cache=0, 
-                   store_kv_cache=0)
-            record("decode", 
-                   op, 
-                   OPs = 2 * batchsize * d_ffn * d / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   load_weight=d_ffn * d * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
-                   load_act=batchsize * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
-                   store_act=batchsize * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
-                   load_kv_cache=0, 
-                   store_kv_cache=0)
+            if op == "FFN_up" or op == "FFN_gate":
+                record("prefill", 
+                    op, 
+                    OPs = 2 * batchsize * seql * d * d_ffn / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    load_weight=d * d_ffn * w_byte / moe_tp_size / moe_ep_size * prefill_average_activated_expertnum, 
+                    load_act=batchsize * seql * d * a_byte / moe_ep_size * (topk + shared_expert_num),
+                    store_act=batchsize * seql * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    load_kv_cache=0, 
+                    store_kv_cache=0)
+                record("decode", 
+                    op, 
+                    OPs = 2 * batchsize * d * d_ffn / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    load_weight= d * d_ffn * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
+                    load_act= batchsize * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
+                    store_act= batchsize * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    load_kv_cache=0, 
+                    store_kv_cache=0)
+            elif op == "FFN_down":
+                record("prefill", 
+                    op, 
+                    OPs = 2 * batchsize * seql * d_ffn * d / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    load_weight=d_ffn * d * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
+                    load_act=batchsize * seql * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    store_act=batchsize * seql * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
+                    load_kv_cache=0, 
+                    store_kv_cache=0)
+                record("decode", 
+                    op, 
+                    OPs = 2 * batchsize * d_ffn * d / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    load_weight=d_ffn * d * w_byte / moe_tp_size / moe_ep_size * decode_average_activated_expertnum, 
+                    load_act=batchsize * d_ffn * a_byte / moe_tp_size / moe_ep_size * (topk + shared_expert_num), 
+                    store_act=batchsize * d * a_byte / moe_ep_size * (topk + shared_expert_num), 
+                    load_kv_cache=0, 
+                    store_kv_cache=0)
         # communication calculation
-        bs1 = global_bachsize // nonmoe_dp_size
-        bs2 = global_bachsize // moe_dp_size
-        # if moe_dp_size >= nonmoe_dp_size, no all2all, one allreduce
-        if moe_dp_size >= nonmoe_dp_size:
-            communication_result["prefill"] += bs1 * 2 * seql * d * (nonmoe_tp_size - 1) / nonmoe_tp_size * a_byte
-            communication_result["decode"] += bs1 * 2 * d * (nonmoe_tp_size - 1) / nonmoe_tp_size * a_byte
-        else: # if moe_dp_size < nonmoe_dp_size, two all2all required, and if moe_tp_size > 0, one allreduce
-            # alltoall 1
-            communication_result["prefill"] += bs1 * seql * topk * d * (moe_ep_size - 1) / moe_ep_size * moe_tp_size / nonmoe_tp_size  * a_byte
-            communication_result["decode"] += bs1 * topk * d * (moe_ep_size - 1) / moe_ep_size * moe_tp_size / nonmoe_tp_size  * a_byte
-            # allreduce
-            communication_result["prefill"] += 2 * bs2 * seql * d * (moe_tp_size - 1) / moe_tp_size * a_byte
-            communication_result["decode"] += 2 * bs2 * d * (moe_tp_size - 1) / moe_tp_size * a_byte
-            # alltoall 2
-            dp_ = nonmoe_dp_size // moe_dp_size
-            communication_result["prefill"] += bs2 * seql * topk * d * (dp_ - 1) / moe_ep_size * nonmoe_tp_size / moe_tp_size * a_byte
-            communication_result["prefill"] += bs2 * topk * d * (dp_ - 1) / moe_ep_size * nonmoe_tp_size / moe_tp_size * a_byte
+        communication_result["prefill"]["MoE_AllReduce"] = 2 * global_bachsize * seql * topk * (moe_tp_size - 1) * d / moe_tp_size / moe_ep_size * a_byte
+        communication_result["decode"]["MoE_AllReduce"] = 2 * global_bachsize * topk * (moe_tp_size - 1) * d / moe_tp_size / moe_ep_size * a_byte
+        if moe_ep_size > 1:
+            communication_result["prefill"]["MoE_All2All_1"] = global_bachsize * seql * topk * d * (nonmoe_dp_size - 1) / nonmoe_dp_size / moe_ep_size * a_byte
+            communication_result["decode"]["MoE_All2All_1"] = global_bachsize * topk * d * (nonmoe_dp_size - 1) / nonmoe_dp_size / moe_ep_size * a_byte
+        else:
+            communication_result["prefill"]["MoE_All2All_1"] = global_bachsize * seql * d * (nonmoe_dp_size - 1) / nonmoe_dp_size * a_byte
+            communication_result["decode"]["MoE_All2All_1"] = global_bachsize * d * (nonmoe_dp_size - 1) / nonmoe_dp_size * a_byte
+        communication_result["prefill"]["MoE_All2All_2"] = communication_result["prefill"]["MoE_All2All_1"]
+        communication_result["decode"]["MoE_All2All_2"] = communication_result["decode"]["MoE_All2All_1"]
             
-
 def GetKVCacheSizePerLayer(): # bytes
     if kv_lora_rank == 0:
         pass
@@ -335,29 +327,28 @@ def GetKVCacheSizePerLayer(): # bytes
         res /= cla
     return res
 
-    
+
 if __name__ == "__main__":
     model_name = "Hunyuan-Large"
     # model_name = "DeepSeek-V3"
     ModelSpec(model_name)
     analyze()
-    
+
     VERBOSE = False
     PrintConfig()
     t = {"prefill":{}, "decode":{}}
     for stage in ['prefill', 'decode']:
         print("Stage:", stage)
         t[stage] = 0
-        if nonmoe_tp_size != 1:
-            if stage == 'prefill':
-                volume = 2 * seql * batchsize * d * a_byte # 一次allreduce的bytes
-                # MLP 和 attention 分别有一次 allreduce
-                networktime = 2 * (nonmoe_tp_size - 1) * (intra_lat + volume / nonmoe_tp_size / 1024 / 1024 / 1024 / intra_bw * 1e6)
-            elif stage == 'decode':
-                volume = 2 * batchsize * d * a_byte 
-                networktime = 2 * (nonmoe_tp_size - 1) * (intra_lat + volume / nonmoe_tp_size / 1024 / 1024 / 1024 / intra_bw * 1e6)
-            t[stage] += networktime
-            print("TP communication overhead in", stage, "stage: ", round(networktime, 3), "us")
+        # Communication Time
+        networktime = (
+            ( communication_result[stage]["Attention_AllReduce"]
+                + communication_result[stage]["MoE_AllReduce"] 
+                + communication_result[stage]["MoE_All2All_1"]
+                + communication_result[stage]["MoE_All2All_2"]
+            ) / 1024 / 1024 / 1024 / intra_bw * 1e6)
+        t[stage] += networktime
+        print("intra-op communication overhead in", stage, "stage: ", round(networktime, 3), "us")
         for op in Operations:
             if VERBOSE:
                 print('{')
@@ -374,63 +365,54 @@ if __name__ == "__main__":
         print("Total time: ", round(t[stage], 2), "us")
     print("")
 
-
-    
     kvsize = GetKVCacheSizePerLayer()
-    print("KV Cache Size per layer: ", round(kvsize / 1024 / 1024 / 1024, 3), "GB")
+    print("KV Cache Size per layer: ", round(kvsize / 1024 / 1024 / 1024, 4), "GB")
+    print("")
 
-    # print("activation size in decode stage: ", round(batchsize * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
-    # print("activation size in prefill stage: ", round(batchsize * seql * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
-    # print("QK intermediate size in decode stage: ", round(batchsize * seql * h * headsize * a_byte / 1024 / 1024 / 1024, 3), "GB")
-    # print("QK intermediate size in prefill stage: ", round(batchsize * seql * seql * h * headsize * a_byte / 1024 / 1024 / 1024, 3), "GB")
+    # # MemoryBW = 50
+    # MemoryBW = 25
+    # print("can prefetch", round(t["decode"] * MemoryBW * 1e-6, 3), "GB every layer, in decode stage, if network bandwidth is", MemoryBW, "GB/s")
+    # print("can prefetch", round(t["prefill"] * MemoryBW * 1e-6, 3), "GB every layer, in prefill stage, if network bandwidth is", MemoryBW, "GB/s")
     # print("")
-
-    # for op in Operations:
-        # if op not in ['qk_matmul', 'softmax', 'sv_matmul']:
-        #     print(op, "weight size: ", round(weight_size[op] / 1024 / 1024 / 1024, 3), "GB")
-    
-    print("")
-    # MemoryBW = 50 
-    MemoryBW = 25 
-    print("can prefetch", round(t["decode"] * MemoryBW * 1e-6, 3), "GB every layer, in decode stage, if network bandwidth is", MemoryBW, "GB/s")
-    print("can prefetch", round(t["prefill"] * MemoryBW * 1e-6, 3), "GB every layer, in prefill stage, if network bandwidth is", MemoryBW, "GB/s")
-    print("")
 
     print("GPU Memory Consumption: ")
     mem_consum = 0
     for op in Operations:
-        if op not in ['qk_matmul', 'softmax', 'sv_matmul']:
+        if op not in ['qk_matmul', 'softmax', 'sv_matmul', 'FFN_up', 'FFN_gate', 'FFN_down']: 
             mem_consum += weight_size[op] / 1024 / 1024 / 1024
-    mem_consum += GetKVCacheSizePerLayer() / 1024 / 1024 / 1024 / nonmoe_tp_size
+    # expert weight单独计算
+    mem_consum += (expert_num + shared_expert_num) * d * d_ffn * 3 * w_byte / 1024 / 1024 / 1024 / moe_tp_size / moe_ep_size
+    mem_consum += GetKVCacheSizePerLayer() / 1024 / 1024 / 1024 / nonmoe_tp_size # KV Cache
     mem_consum *= L / pp_size
-    print("Prefill stage: ", round(mem_consum + seql*batchsize*max(2*d_ffn/nonmoe_tp_size, d)*a_byte/1024/1024/1024, 3), "GB")
-    print("Decode stage: ", round(mem_consum + batchsize*max(2*d_ffn/nonmoe_tp_size, d)*a_byte/1024/1024/1024, 3), "GB")
+    # activation size = max(attention_part, moe_part)
+    bs1, bs2 = global_bachsize / nonmoe_dp_size, global_bachsize / moe_dp_size
+    print("Prefill stage(w/o activation): ", round(mem_consum, 3), "GB")
+    print("Decode stage(w/o activation): ", round(mem_consum, 3), "GB")
+    print("Prefill stage(w/ activation): ", round(mem_consum + max(max(bs1*seql*seql, bs1*seql*d), max(bs2*seql*d_ffn*2/moe_tp_size/moe_ep_size, bs2*seql*d/moe_ep_size)) * a_byte/1024/1024/1024, 3), "GB")
+    print("Decode stage(w/ activation): ", round(mem_consum + max(bs1*d, max(bs2*d_ffn*2/moe_tp_size/moe_ep_size, bs2*d/moe_ep_size))*a_byte/1024/1024/1024, 3), "GB")
     print("")
 
-
-
     iteration_t = {"prefill":0, "decode":0}
-    
-    comm_time = intra_lat + seql * batchsize * d * a_byte / 1024 / 1024 / 1024 / intra_bw * 1e6
+
+    comm_time = seql * bs1 * d * a_byte / 1024 / 1024 / 1024 / intra_bw * 1e6
     iteration_t["prefill"] = L * t["prefill"] + (pp_size - 1) * comm_time
-    # print("Prefill Iteration latency: ", round(L * t["prefill"] + (pp_size - 1) * comm_time, 3), "us")
     print("Prefill Iteration latency: ", round(iteration_t["prefill"] / 1000, 3), "ms")
-    comm_time = intra_lat + batchsize * d * a_byte / 1024 / 1024 / 1024 / intra_bw * 1e6
+    comm_time = bs1 * d * a_byte / 1024 / 1024 / 1024 / intra_bw * 1e6
     iteration_t["decode"] = L * t["decode"] + (pp_size - 1) * comm_time
-    # print("Decode Iteration latency: ", round(L * t["decode"] + (pp_size - 1) * comm_time, 3), "us")
     print("Decode Iteration latency: ", round(iteration_t["decode"] / 1000, 3), "ms")
 
     print("")
     print("Throughput: ")
     if pp_size == 1:
-        print("prefill throughput: ", round(batchsize * seql / iteration_t["prefill"] * 1e6, 3), " tokens/s")
-        print("decode throughput: ", round(batchsize / iteration_t["decode"] * 1e6, 3), " tokens/s")
+        print("prefill throughput: ", round(global_bachsize * seql / iteration_t["prefill"] * 1e6, 3), " tokens/s")
+        print("decode throughput: ", round(global_bachsize / iteration_t["decode"] * 1e6, 3), " tokens/s")
     elif pp_size != 1: 
         micro_batch_num = 100 
-        print("prefill throughput: ", round(batchsize * micro_batch_num * seql / (iteration_t["prefill"] + iteration_t["prefill"] / pp_size * (micro_batch_num - 1)) * 1e6, 3), " tokens/s")
-        print("decode throughput: ", round(batchsize * micro_batch_num / (iteration_t["decode"] + iteration_t["decode"] / pp_size * (micro_batch_num - 1)) * 1e6, 3), " tokens/s")
+        print("prefill throughput: ", round(global_bachsize * micro_batch_num * seql / (iteration_t["prefill"] + iteration_t["prefill"] / pp_size * (micro_batch_num - 1)) * 1e6, 3), " tokens/s")
+        print("decode throughput: ", round(global_bachsize * micro_batch_num / (iteration_t["decode"] + iteration_t["decode"] / pp_size * (micro_batch_num - 1)) * 1e6, 3), " tokens/s")
 
-# Decode Scale Results 
+
+# Decode Scale Results
 # seql = 512, batchsize = 100, micro-batch-num = 100
 # GPU num: 1, 2, 3, 4, 5, 6, 7, 8
 # Throughput
@@ -440,7 +422,7 @@ if __name__ == "__main__":
 # TP     : OOM, OOM, 28, 22, 18, 16, 14, 13
 # PP     : OOM, OOM, 82, 82, 82, 82, 82, 82
 
-# Prefill Scale Results 
+# Prefill Scale Results
 # seql = 512, batchsize = 1, micro-batch-num = 100
 # GPU num: 1, 2, 3, 4, 5, 6, 7, 8
 # Throughput
