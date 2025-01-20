@@ -9,4 +9,5 @@ Change 'workload spec', 'hardware spec', 'parallelization spec' and 'model spec'
 `python modeling_moe.py`
 
 Note: haven't modeling different network bandwidth of intra-node and inter-node.
+
 Note: asserts moe_dp=1 for simplicity.
