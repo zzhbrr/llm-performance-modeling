@@ -38,10 +38,10 @@ headsize = d // h
 
 # Workload Spec
 batchsize = 1
-seql = 1024 # sequence length
+seql = 5502 # sequence length
 
 # Parallelization Spec
-tp_size = 1
+tp_size = 8
 pp_size = 1
 # intra_bw = 50 # GB/s
 intra_bw = 400 # GB/s
@@ -51,7 +51,7 @@ intra_lat = 1.5 # us
 
 
 def ModelSpec(model_name):
-    global d, d_ffn, h, h_kv, a_byte, w_byte, kv_byte, headsize
+    global d, d_ffn, h, h_kv, a_byte, w_byte, kv_byte, headsize, L
     if model_name == "Llama2-70B":
         L = 80
         d = 8192 
@@ -250,7 +250,8 @@ def GetKVCacheSizePerLayer(): # bytes
 
     
 if __name__ == "__main__":
-    model_name = "OPT-30B"
+    model_name = "Llama2-70B"
+    # model_name = "OPT-30B"
     # model_name = "7B"
     ModelSpec(model_name)
     analyze()
@@ -289,8 +290,8 @@ if __name__ == "__main__":
 
 
     
-    # kvsize = GetKVCacheSizePerLayer()
-    # print("KV Cache Size: ", round(kvsize / 1024 / 1024 / 1024, 3), "GB")
+    kvsize = GetKVCacheSizePerLayer()
+    print("KV Cache Size per layer: ", round(kvsize / 1024 / 1024 / 1024, 3), "GB")
 
     # print("activation size in decode stage: ", round(batchsize * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
     # print("activation size in prefill stage: ", round(batchsize * seql * d * a_byte / 1024 / 1024 / 1024, 3), "GB")
@@ -302,10 +303,12 @@ if __name__ == "__main__":
         # if op not in ['qk_matmul', 'softmax', 'sv_matmul']:
         #     print(op, "weight size: ", round(weight_size[op] / 1024 / 1024 / 1024, 3), "GB")
     
-    print("")
-    MemoryBW = 50 
-    print("can prefetch", round(t["decode"] * MemoryBW * 1e-6, 3), "GB every layer if network bandwidth is", MemoryBW, "GB/s")
-    print("")
+    # print("")
+    # # MemoryBW = 50 
+    # MemoryBW = 25 
+    # print("can prefetch", round(t["decode"] * MemoryBW * 1e-6, 3), "GB every layer, in decode stage, if network bandwidth is", MemoryBW, "GB/s")
+    # print("can prefetch", round(t["prefill"] * MemoryBW * 1e-6, 3), "GB every layer, in prefill stage, if network bandwidth is", MemoryBW, "GB/s")
+    # print("")
 
     print("GPU Memory Consumption: ")
     mem_consum = 0

@@ -235,7 +235,7 @@ def GetKVCacheSizePerLayer(): # bytes
     
 if __name__ == "__main__":
     # model_name = "OPT-30B"
-    model_name = "7B"
+    # model_name = "7B"
     ModelSpec(model_name)
     analyze()
     
