@@ -410,24 +410,3 @@ if __name__ == "__main__":
         micro_batch_num = 100 
         print("prefill throughput: ", round(global_bachsize * micro_batch_num * seql / (iteration_t["prefill"] + iteration_t["prefill"] / pp_size * (micro_batch_num - 1)) * 1e6, 3), " tokens/s")
         print("decode throughput: ", round(global_bachsize * micro_batch_num / (iteration_t["decode"] + iteration_t["decode"] / pp_size * (micro_batch_num - 1)) * 1e6, 3), " tokens/s")
-
-
-# Decode Scale Results
-# seql = 512, batchsize = 100, micro-batch-num = 100
-# GPU num: 1, 2, 3, 4, 5, 6, 7, 8
-# Throughput
-# TP     : OOM, OOM, 3467, 4483, 5411, 6426, 6987, 7633
-# PP     : OOM, OOM, 3561, 4702, 5820, 6917, 7994, 9050
-# Latency
-# TP     : OOM, OOM, 28, 22, 18, 16, 14, 13
-# PP     : OOM, OOM, 82, 82, 82, 82, 82, 82
-
-# Prefill Scale Results
-# seql = 512, batchsize = 1, micro-batch-num = 100
-# GPU num: 1, 2, 3, 4, 5, 6, 7, 8
-# Throughput
-# TP     : 7122(OOM), 13156, 18229, 22463, 25974, 28865, 31226, 33023
-# PP     : 7122(OOM), 14100, 20938, 27639, 34208, 40648, 46963, 53157
-# Latency
-# TP     : 71, 38, 28, 22, 19, 17, 16, 15
-# PP     : 71, 71, 71, 71, 71, 71, 71, 72
